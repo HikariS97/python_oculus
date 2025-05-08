@@ -14,6 +14,11 @@ import itertools  # dict to list for csv writing.
 Global Configuration
 '''
 config = {
+    'print_received_metadata': True,
+    'show_raw_image': True,
+    'show_rect_image': True,
+    'resize_for_display': True,
+    'resize_scale': 0.3,
     'save_csv': True,
     'save_raw_image': True,
     'save_rect_image': True,
@@ -67,16 +72,31 @@ status_message = [
     FieldDef('pressure',      'd', 134, 8,  'bar', 'Pressure rating')
 ]
 
-def get_bit_flags():
+def get_flags():
     flags = [
         1,  # RangeInMetres: 1: range in metres, 0: range in percent.
-        1,  # 16BitImg: 1: 16 bit image, 0: 8 bit image.
+        0,  # 16BitImg: 1: 16 bit image, 0: 8 bit image.
         0,  # GainSend: 1: send gain value, 0: do not send gain value.
         1,  # SimpleReturn: 1: simple return, 0: full return.
         0,  # GainAssist: 1: gain assist, 0: no gain assist.
         0,  # LowPower: 1: low power mode, 0: normal mode.
         1,  # FullBeams: 1: 512 beams, 0: 256 beams.
         0,  # NetworkTrigger: 1: fires when instructed, 0: fires automatically.
+    ]
+
+    return sum(bit << i for i, bit in enumerate(flags))
+
+def get_ext_flags():
+    flags = [
+        0,  # gainReduce6dB: 1: gain reduce 6dB, 0: no gain reduce.
+        0,  # gainReduce12dB: 1: gain reduce 12dB, 0: no gain reduce.
+        0,  # gainBoost: 1: gain boost, 0: no gain boost.
+        0,  # chirpEnabled: 1: chirp enabled, 0: chirp disabled
+        0,  # transmitBoost: 1: transmit boost, 0: no transmit boost.
+        1,  # advancedCompression: 1: advanced compression, 0: no advanced compression.
+        0,  # 4 bits image: 1: 4 bits image, 0: no 4 bits image.
+        0,  # UDPDataOutput: 1: UDP data output, 0: TCP data output.
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # reserved for future use.
     ]
 
     return sum(bit << i for i, bit in enumerate(flags))
@@ -93,28 +113,34 @@ def get_simple_fire_V2_request_bytes():
         1032,  # 2 bytes, part number.
 
         2,   # 1 byte, current run mode 1: LowFrequency, 2: HighFrequency, 3:PingerLocator.
-        2,  # 1 byte, maximum ping rate 0: 10Hz Max, 1: 15Hz Max, 2: 40Hz Max, 3: 5Hz Max, 4: 2Hz Max, 5: Pinging disabled.
+        4,  # 1 byte, maximum ping rate 0: 10Hz Max, 1: 15Hz Max, 2: 40Hz Max, 3: 5Hz Max, 4: 2Hz Max, 5: Pinging disabled.
         100, # 1 byte, maximum network speed.
         127, # 1 byte, gamma correction value.
-        get_bit_flags(), # 1 byte, bit flags.
-        1,     # 8 bytes, demanded range in metres or percent.
+        get_flags(), # 1 byte, bit flags.
+        10,     # 8 bytes, demanded range in metres or percent.
         75.0,   # 8 bytes, demanded gain value in percent.
         1533.0, # 8 bytes, speed-of-sound used.
         35.0,   # 8 bytes, salinity of the environment.
-        0xCAFEBABE, # 4 bytes, extended flags (section 0).
-        0, 0,   # 8 bytes, reserved for future use.
-        0,      # 4 bytes, the frequency of the pinger beacon.
-        0, 0, 0, 0, 0  # 20 bytes, reserved for future use.
+        get_ext_flags(),  # 4 bytes, extended flags.
+        0,  # 1 byte, despeckle setting.
+        512,  # 2 bytes, number of beams.
+        2048,  # 2 bytes, number of MAX range lines.
+        0, 0, 0,  # 3 bytes, reserved for future use.
+        0, 0, 0, 0, 0, 0,  # 24 bytes, reserved for future use.
     ]
 
     packed = struct.pack(
-        '<5H1I1H5B4d9I',
+        '<5H1I1H5B4d1I1B2H3B6I',
         *data[0:5],
         data[5],
         data[6],
         *data[7:12],
         *data[12:16],
-        *data[16:25],
+        *data[16:20],
+        *data[20:21],
+        *data[21:23],
+        *data[23:26],
+        *data[26:32],
     )
 
     return packed
@@ -270,7 +296,7 @@ class TCPClientProtocol:
                         if self.buffer[header_pos + 6] == 0x23:
                             payload_size = int.from_bytes(self.buffer[header_pos + 10:header_pos + 14], 'little')
                             if len(self.buffer) >= 16 + payload_size:
-                                asyncio.create_task(DataProcessor.process(self.buffer[header_pos:header_pos + 16 + payload_size]))
+                                DataProcessor._current_task = asyncio.create_task(DataProcessor.process(self.buffer[header_pos:header_pos + 16 + payload_size]))
                                 del self.buffer[:header_pos + 16 + payload_size]
                             del self.buffer[:header_pos]
                         else:
@@ -350,6 +376,14 @@ class DataProcessor:
         return image[LUT[:, :, 0], LUT[:, :, 1]]
 
     @staticmethod
+    def print_metadata(metadata):
+        print(f"\nReceived TCP data:")
+        for name, info in metadata.items():
+            if info is None:
+                continue
+            print(f"{name:15} : {info}")
+
+    @staticmethod
     async def process(data):
         parsed = PacketParser.parse_simple_ping_V2_result(data)
 
@@ -358,6 +392,9 @@ class DataProcessor:
             [name, info['value']] for name, info in parsed.items() if info is not None
         ]
         metadata = dict(metadata)
+
+        if config['print_received_metadata']:
+            DataProcessor.print_metadata(metadata)
 
         # process payload.
         payload_pos = metadata['imageOffset']
@@ -383,16 +420,28 @@ class DataProcessor:
             dt = np.dtype(np.uint16)
         elif dataSize == 2:
             dt = np.dtype(np.uint24)
-        else:
+        elif dataSize == 3:
             dt = np.dtype(np.uint32)
+        elif dataSize == 4:
+            pass # TODO: 4 bits image.
         dt = dt.newbyteorder('<')
         image_payload = np.frombuffer(image_payload, dtype=dt)
         image = image_payload.reshape(bin_num, beam_num)
         normalized = ((image - np.min(image)) / (np.max(image) - np.min(image)) * 255).astype(np.uint8)
         LUT = DataProcessor.get_LUT(normalized, metadata)
         rect = DataProcessor.map_by_LUT(normalized, LUT)
-        DataProcessor.render_opencv('normalized raw data', normalized)
-        DataProcessor.render_opencv('raw data mapped to Cartesian coordinate', rect)
+        if config['show_raw_image']:
+            if config['resize_for_display']:
+                normalized_resized = cv2.resize(normalized, (0, 0), fx=config['resize_scale'], fy=config['resize_scale'])
+            else:
+                normalized_resized = normalized
+            DataProcessor.render_opencv('normalized raw data', normalized_resized)
+        if config['show_rect_image']:
+            if config['resize_for_display']:
+                rect_resized = cv2.resize(rect, (0, 0), fx=config['resize_scale'], fy=config['resize_scale'])
+            else:
+                rect_resized = rect
+            DataProcessor.render_opencv('raw data mapped to Cartesian coordinate', rect_resized)
 
         # save metadata.
         if config['save_raw_image']:
